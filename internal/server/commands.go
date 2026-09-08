@@ -29,9 +29,23 @@ func (s *Server) execute(command []string, client *Client, replay, alreadyLocked
 	}
 	response, mutated := s.executeUnlocked(command, client)
 	if mutated && !replay {
-		s.recordMutation(command)
+		s.recordMutation(mutationCommand(command, response))
 	}
 	return response, mutated
+}
+
+func mutationCommand(command []string, response resp.Value) []string {
+	if len(command) > 0 && (strings.EqualFold(command[0], "BLPOP") || strings.EqualFold(command[0], "BRPOP")) && len(response.Array) >= 2 {
+		name := "LPOP"
+		if strings.EqualFold(command[0], "BRPOP") {
+			name = "RPOP"
+		}
+		key, ok := response.Array[0].StringValue()
+		if ok {
+			return []string{name, key}
+		}
+	}
+	return command
 }
 
 func isMutation(name string) bool {
@@ -676,6 +690,7 @@ func (s *Server) blockingPop(command []string, left bool) (resp.Value, bool) {
 		deadline = time.Now().Add(time.Duration(timeoutSeconds * float64(time.Second)))
 	}
 	for {
+		changed := s.store.Change()
 		for _, key := range keys {
 			values, err := s.store.ListPop(key, left, nil)
 			if err != nil {
@@ -685,7 +700,12 @@ func (s *Server) blockingPop(command []string, left bool) (resp.Value, bool) {
 				return resp.ArrayValue(resp.BulkStringValue(key), resp.BulkStringValue(values[0])), true
 			}
 		}
-		changed := s.store.Change()
+		// Capture the notification channel before checking the list. If a
+		// producer wins the race after a failed pop, retry instead of waiting on
+		// a channel that was already replaced.
+		if s.store.Change() != changed {
+			continue
+		}
 		if timeoutSeconds == 0 {
 			select {
 			case <-changed:
@@ -778,6 +798,7 @@ func (s *Server) xread(command []string) (resp.Value, bool) {
 		return resp.ErrorValue("ERR " + err.Error()), false
 	}
 	for {
+		changed := s.store.Change()
 		result := s.store.XRead(requests, count)
 		if len(result) > 0 {
 			outer := make([]resp.Value, 0, len(result))
@@ -789,7 +810,9 @@ func (s *Server) xread(command []string) (resp.Value, bool) {
 		if !blocking {
 			return resp.NullArrayValue(), false
 		}
-		changed := s.store.Change()
+		if s.store.Change() != changed {
+			continue
+		}
 		if block == 0 {
 			select {
 			case <-changed:

@@ -694,39 +694,6 @@ func (s *Store) ZCard(key string) (int, error) {
 	return len(s.sorted[key]), nil
 }
 
-func (s *Store) GeoAdd(key string, locations []GeoLocation) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.purgeExpiredLocked(key, time.Now())
-	if kind := s.kindLocked(key); kind != TypeNone && kind != TypeZSet {
-		return 0, ErrWrongType
-	}
-	if s.sorted[key] == nil {
-		s.sorted[key] = make(map[string]float64)
-	}
-	if s.geos[key] == nil {
-		s.geos[key] = make(map[string]GeoLocation)
-	}
-	added := 0
-	for _, location := range locations {
-		if _, exists := s.geos[key][locationMember(location)]; !exists {
-			added++
-		}
-		member := locationMember(location)
-		s.geos[key][member] = location
-		s.sorted[key][member] = location.Score
-	}
-	if len(locations) > 0 {
-		s.touchLocked(key)
-	}
-	return added, nil
-}
-
-// locationMember is replaced by the command layer before calling GeoAdd; the
-// store keeps the member in GeoLocation's private map key through this helper.
-// Keeping the command-facing type small avoids duplicating the sorted-set map.
-func locationMember(location GeoLocation) string { return fmt.Sprintf("%.17g", location.Score) }
-
 func (s *Store) GeoPut(key, member string, location GeoLocation) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
