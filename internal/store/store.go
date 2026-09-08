@@ -535,10 +535,10 @@ func (s *Store) XRange(key, start, end string, count int) ([]StreamEntry, error)
 	return result, nil
 }
 
-func (s *Store) XRead(requests []StreamReadRequest, count int) []struct {
+func (s *Store) XRead(requests []StreamReadRequest, count int) ([]struct {
 	Key     string
 	Entries []StreamEntry
-} {
+}, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]struct {
@@ -546,6 +546,10 @@ func (s *Store) XRead(requests []StreamReadRequest, count int) []struct {
 		Entries []StreamEntry
 	}, 0, len(requests))
 	for _, request := range requests {
+		s.purgeExpiredLocked(request.Key, time.Now())
+		if kind := s.kindLocked(request.Key); kind != TypeNone && kind != TypeStream {
+			return nil, ErrWrongType
+		}
 		entries := make([]StreamEntry, 0)
 		for _, entry := range s.streams[request.Key] {
 			if entry.ID.Compare(request.Start) > 0 {
@@ -562,12 +566,13 @@ func (s *Store) XRead(requests []StreamReadRequest, count int) []struct {
 			}{request.Key, entries})
 		}
 	}
-	return result
+	return result, nil
 }
 
 func (s *Store) StreamLastID(key string) (StreamID, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(key, time.Now())
 	entries := s.streams[key]
 	if len(entries) == 0 {
 		return StreamID{}, false
@@ -967,18 +972,20 @@ func (s *Store) LoadString(key string, value []byte, deadline *time.Time) error 
 }
 
 func (s *Store) Versions(keys ...string) map[string]uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	result := make(map[string]uint64, len(keys))
 	for _, key := range keys {
+		s.purgeExpiredLocked(key, time.Now())
 		result[key] = s.versions[key]
 	}
 	return result
 }
 
 func (s *Store) Version(key string) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(key, time.Now())
 	return s.versions[key]
 }
 

@@ -799,7 +799,10 @@ func (s *Server) xread(command []string) (resp.Value, bool) {
 	}
 	for {
 		changed := s.store.Change()
-		result := s.store.XRead(requests, count)
+		result, err := s.store.XRead(requests, count)
+		if err != nil {
+			return storeError(err), false
+		}
 		if len(result) > 0 {
 			outer := make([]resp.Value, 0, len(result))
 			for _, streamResult := range result {
@@ -882,7 +885,11 @@ func (s *Server) infoCommand(command []string) resp.Value {
 	if s.cfg.ReplicaOf != "" {
 		role = "slave"
 	}
-	info := fmt.Sprintf("# Replication\r\nrole:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d\r\nconnected_slaves:%d\r\n", role, s.replID, s.replOffset, len(s.replicas))
+	replID := s.replID
+	if role == "slave" && s.masterReplID != "" {
+		replID = s.masterReplID
+	}
+	info := fmt.Sprintf("# Replication\r\nrole:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d\r\nconnected_slaves:%d\r\n", role, replID, s.replOffset, len(s.replicas))
 	s.replMu.Unlock()
 	if section != "" && section != "replication" {
 		return resp.BulkStringValue("")
@@ -891,6 +898,11 @@ func (s *Server) infoCommand(command []string) resp.Value {
 }
 
 func (s *Server) saveCommand() resp.Value {
+	if s.cfg.Dir != "" {
+		if err := os.MkdirAll(s.cfg.Dir, 0o750); err != nil {
+			return resp.ErrorValue("ERR " + err.Error())
+		}
+	}
 	path := s.cfg.DBFilename
 	if path == "" {
 		path = "dump.rdb"
@@ -917,18 +929,27 @@ func (s *Server) authCommand(command []string, client *Client) resp.Value {
 		return wrongArgs("AUTH")
 	}
 	s.usersMu.RLock()
-	user := s.users[name]
-	s.usersMu.RUnlock()
-	if user == nil || !user.Enabled {
+	configured := s.users[name]
+	if configured == nil {
+		s.usersMu.RUnlock()
 		return resp.ErrorValue("WRONGPASS invalid username-password pair or user is disabled")
 	}
-	if user.NoPass {
-		client.user, client.authenticated = user, true
+	enabled, noPass := configured.Enabled, configured.NoPass
+	passwords := make([][32]byte, 0, len(configured.Passwords))
+	for digest := range configured.Passwords {
+		passwords = append(passwords, digest)
+	}
+	s.usersMu.RUnlock()
+	if !enabled {
+		return resp.ErrorValue("WRONGPASS invalid username-password pair or user is disabled")
+	}
+	if noPass {
+		client.user, client.authenticated = &User{Name: name, Enabled: true, NoPass: true}, true
 		return resp.Simple("OK")
 	}
 	digest := sha256.Sum256([]byte(password))
 	valid := false
-	for expected := range user.Passwords {
+	for _, expected := range passwords {
 		if subtle.ConstantTimeCompare(expected[:], digest[:]) == 1 {
 			valid = true
 			break
@@ -937,7 +958,7 @@ func (s *Server) authCommand(command []string, client *Client) resp.Value {
 	if !valid {
 		return resp.ErrorValue("WRONGPASS invalid username-password pair or user is disabled")
 	}
-	client.user, client.authenticated = user, true
+	client.user, client.authenticated = &User{Name: name, Enabled: true, NoPass: false}, true
 	return resp.Simple("OK")
 }
 
@@ -956,21 +977,28 @@ func (s *Server) aclCommand(command []string, client *Client) resp.Value {
 			return wrongArgs("ACL GETUSER")
 		}
 		s.usersMu.RLock()
-		user := s.users[command[2]]
-		s.usersMu.RUnlock()
-		if user == nil {
+		configured := s.users[command[2]]
+		if configured == nil {
+			s.usersMu.RUnlock()
 			return resp.Bulk(nil)
 		}
+		enabled, noPass := configured.Enabled, configured.NoPass
+		passwordStrings := make([]string, 0, len(configured.Passwords))
+		for digest := range configured.Passwords {
+			passwordStrings = append(passwordStrings, fmt.Sprintf("%x", digest[:]))
+		}
+		s.usersMu.RUnlock()
 		flags := []resp.Value{resp.BulkStringValue("on")}
-		if !user.Enabled {
+		if !enabled {
 			flags = []resp.Value{resp.BulkStringValue("off")}
 		}
-		if user.NoPass {
+		if noPass {
 			flags = append(flags, resp.BulkStringValue("nopass"))
 		}
-		passwords := make([]resp.Value, 0, len(user.Passwords))
-		for digest := range user.Passwords {
-			passwords = append(passwords, resp.BulkStringValue(fmt.Sprintf("%x", digest[:])))
+		sort.Strings(passwordStrings)
+		passwords := make([]resp.Value, 0, len(passwordStrings))
+		for _, password := range passwordStrings {
+			passwords = append(passwords, resp.BulkStringValue(password))
 		}
 		return resp.ArrayValue(resp.BulkStringValue("flags"), resp.ArrayValue(flags...), resp.BulkStringValue("passwords"), resp.ArrayValue(passwords...))
 	case "SETUSER":

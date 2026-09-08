@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,6 +211,14 @@ func TestServerTransactionsWatchBlockingAndPubSub(t *testing.T) {
 	if aborted := watcher.command(t, "EXEC"); !aborted.NullArray {
 		t.Fatalf("WATCH did not abort transaction: %#v", aborted)
 	}
+	requireSimple(t, watcher.command(t, "SET", "expiring", "value", "PX", "20"), "OK")
+	requireSimple(t, watcher.command(t, "WATCH", "expiring"), "OK")
+	requireSimple(t, watcher.command(t, "MULTI"), "OK")
+	_ = watcher.command(t, "GET", "expiring")
+	time.Sleep(35 * time.Millisecond)
+	if aborted := watcher.command(t, "EXEC"); !aborted.NullArray {
+		t.Fatalf("WATCH did not observe passive expiry: %#v", aborted)
+	}
 
 	blpop := dialTestClient(t, addr)
 	resultCh := make(chan resp.Value, 1)
@@ -235,6 +244,27 @@ func TestServerTransactionsWatchBlockingAndPubSub(t *testing.T) {
 	if len(message.Array) != 3 || string(message.Array[0].Bytes) != "message" || string(message.Array[2].Bytes) != "ready" {
 		t.Fatalf("unexpected pub/sub message: %#v", message)
 	}
+}
+
+func TestServerAuthentication(t *testing.T) {
+	_, addr, _ := startTestServer(t, Config{Addr: freeAddress(t)})
+	admin := dialTestClient(t, addr)
+	requireSimple(t, admin.command(t, "ACL", "SETUSER", "app", "resetpass", ">secret"), "OK")
+	requireSimple(t, admin.command(t, "ACL", "SETUSER", "default", "resetpass", ">root-secret"), "OK")
+	app := dialTestClient(t, addr)
+	if denied := app.command(t, "GET", "key"); denied.Kind != resp.Error || !strings.Contains(string(denied.Bytes), "NOAUTH") {
+		t.Fatalf("unauthenticated command was not denied: %#v", denied)
+	}
+	requireSimple(t, app.command(t, "AUTH", "app", "secret"), "OK")
+	requireBulk(t, app.command(t, "ACL", "WHOAMI"), "app")
+	if wrong := app.command(t, "AUTH", "app", "wrong"); wrong.Kind != resp.Error || !strings.Contains(string(wrong.Bytes), "WRONGPASS") {
+		t.Fatalf("bad password was not rejected: %#v", wrong)
+	}
+	fresh := dialTestClient(t, addr)
+	if denied := fresh.command(t, "PING"); denied.Kind != resp.Error || !strings.Contains(string(denied.Bytes), "NOAUTH") {
+		t.Fatalf("default password did not enforce auth: %#v", denied)
+	}
+	requireSimple(t, fresh.command(t, "AUTH", "root-secret"), "OK")
 }
 
 func TestServerAOFRecovery(t *testing.T) {

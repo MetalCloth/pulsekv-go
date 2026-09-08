@@ -87,12 +87,13 @@ type Server struct {
 	channels map[string]map[*Client]struct{}
 	patterns map[string]map[*Client]struct{}
 
-	replMu      sync.Mutex
-	replID      string
-	replOffset  int64
-	replicas    map[*Client]*replicaState
-	ackChanged  chan struct{}
-	replicaConn net.Conn
+	replMu       sync.Mutex
+	replID       string
+	masterReplID string
+	replOffset   int64
+	replicas     map[*Client]*replicaState
+	ackChanged   chan struct{}
+	replicaConn  net.Conn
 
 	aof *persistence.AOF
 }
@@ -267,7 +268,11 @@ func (s *Server) removeClient(client *Client) {
 	s.clientsMu.Unlock()
 	s.removeSubscriptions(client)
 	s.replMu.Lock()
-	delete(s.replicas, client)
+	if _, wasReplica := s.replicas[client]; wasReplica {
+		delete(s.replicas, client)
+		close(s.ackChanged)
+		s.ackChanged = make(chan struct{})
+	}
 	s.replMu.Unlock()
 }
 
@@ -287,8 +292,11 @@ func (s *Server) Close() error {
 		for _, client := range clients {
 			_ = client.conn.Close()
 		}
-		if s.replicaConn != nil {
-			_ = s.replicaConn.Close()
+		s.replMu.Lock()
+		upstream := s.replicaConn
+		s.replMu.Unlock()
+		if upstream != nil {
+			_ = upstream.Close()
 		}
 		if closeErr := s.aof.Close(); err == nil {
 			err = closeErr
@@ -441,9 +449,7 @@ func (s *Server) recordMutation(command []string) {
 	s.replMu.Unlock()
 	for _, peer := range peers {
 		if err := peer.sendRaw(frame); err != nil {
-			s.replMu.Lock()
-			delete(s.replicas, peer)
-			s.replMu.Unlock()
+			s.removeReplica(peer)
 			_ = peer.conn.Close()
 		}
 	}
@@ -453,6 +459,10 @@ func (s *Server) handlePSYNC(client *Client, command []string) resp.Value {
 	if len(command) != 3 {
 		return resp.ErrorValue("ERR wrong number of arguments for PSYNC")
 	}
+	// Keep offset capture, snapshot transfer, and registration in one mutation
+	// interval so a write cannot land between the RDB and command stream.
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	s.replMu.Lock()
 	id, offset := s.replID, s.replOffset
 	s.replMu.Unlock()
@@ -474,6 +484,16 @@ func (s *Server) updateReplicaAck(client *Client, offset int64) {
 	s.replMu.Lock()
 	if state := s.replicas[client]; state != nil && offset > state.ackOffset {
 		state.ackOffset = offset
+		close(s.ackChanged)
+		s.ackChanged = make(chan struct{})
+	}
+	s.replMu.Unlock()
+}
+
+func (s *Server) removeReplica(client *Client) {
+	s.replMu.Lock()
+	if _, ok := s.replicas[client]; ok {
+		delete(s.replicas, client)
 		close(s.ackChanged)
 		s.ackChanged = make(chan struct{})
 	}
@@ -554,10 +574,16 @@ func (s *Server) replicateOnce() error {
 	if err != nil {
 		return err
 	}
+	s.replMu.Lock()
 	s.replicaConn = conn
+	s.replMu.Unlock()
 	defer func() {
 		_ = conn.Close()
-		s.replicaConn = nil
+		s.replMu.Lock()
+		if s.replicaConn == conn {
+			s.replicaConn = nil
+		}
+		s.replMu.Unlock()
 	}()
 	reader := resp.NewReader(conn)
 	for _, command := range [][]string{
@@ -584,6 +610,14 @@ func (s *Server) replicateOnce() error {
 		return fmt.Errorf("unexpected PSYNC response")
 	}
 	if status.Kind == resp.SimpleString && strings.HasPrefix(line, "FULLRESYNC ") {
+		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			return errors.New("invalid FULLRESYNC response")
+		}
+		offset, parseErr := strconv.ParseInt(parts[2], 10, 64)
+		if parseErr != nil || offset < 0 {
+			return errors.New("invalid FULLRESYNC offset")
+		}
 		snapshot, err := reader.Read()
 		if err != nil {
 			return err
@@ -594,6 +628,10 @@ func (s *Server) replicateOnce() error {
 		if err := persistence.LoadRDBBytes(snapshot.Bytes, s.store); err != nil {
 			return err
 		}
+		s.replMu.Lock()
+		s.masterReplID = parts[1]
+		s.replOffset = offset
+		s.replMu.Unlock()
 	}
 	for {
 		value, err := reader.Read()
