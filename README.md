@@ -144,7 +144,7 @@ propagation. Reproduction steps and the current response are in
 
 | Repository | Role | Status |
 | --- | --- | --- |
-| [`MetalCloth/pyswitch`](https://github.com/MetalCloth/pyswitch) | Python payment-switch service with Compose deployment, load smoke, and observability | complete local deployment; cloud deployment needs provider credentials/configuration |
+| [`MetalCloth/pyswitch`](https://github.com/MetalCloth/pyswitch) | Python payment-switch service with Compose deployment, load smoke, and observability | verified local and Render synthetic deployment; production provider credentials intentionally disabled |
 | [`MetalCloth/pulsekv-go`](https://github.com/MetalCloth/pulsekv-go) | Go Redis-compatible server built from the CodeCrafters checklist | active implementation; archive branch preserves the former `number_41` app |
 
 The C++ PulseKV repository remains independent and paused. No source is shared
