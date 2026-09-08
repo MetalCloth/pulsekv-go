@@ -1,5 +1,6 @@
 # Go build and test output
 /bin/
+/pulsekv
 /.cache/
 *.test
 *.out
