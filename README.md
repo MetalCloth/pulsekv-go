@@ -1,254 +1,161 @@
-# Chinook RAG Q&A System 🎵
+# Pulsekv Go
 
-A real-world RAG (Retrieval-Augmented Generation) system that combines structured database queries with semantic search over unstructured data. Built with LangChain, LangGraph, and Streamlit.
+Pulsekv Go is a dependency-free Redis-compatible server written in Go. It is
+the second repository in the Pulsekv portfolio and the Go successor to the
+paused C++ experiment. The original `MetalCloth/number_41` repository was a
+Chinook RAG demo; its exact history is preserved on
+[`archive/number-41-rag`](https://github.com/MetalCloth/pulsekv-go/tree/archive/number-41-rag)
+and in the `number-41-rag-archive-2026-09-08` tag before the repository was
+renamed.
 
-## 🎯 What This Does
+The implementation follows the CodeCrafters Build Your Own Redis sequence.
+The stage checklist, acceptance notes, and known ceilings live in
+[`docs/codecrafters-checklist.md`](docs/codecrafters-checklist.md). The two
+learning references are cited throughout the design notes:
 
-This system lets you ask natural language questions about the Chinook music store database AND customer reviews. The AI agent intelligently decides whether to:
-- Query the PostgreSQL database for factual data (sales, customers, invoices)
-- Search through customer reviews using semantic similarity
-- Use both sources to give you comprehensive answers
+- [Build Redis from scratch](https://www.build-redis-from-scratch.dev/en/introduction)
+- [feliposz/codecrafters-redis-go](https://github.com/feliposz/codecrafters-redis-go)
 
-**Example questions:**
-- "What are the top 5 selling albums?"
-- "Show me complaints about shipping"
-- "Which customers spent the most money and what do they think about our service?"
+They are references for protocol and milestone shape, never vendored source.
 
-## 🏗️ Architecture
+## What is here
 
-```
-User Question
-    ↓
-ReAct Agent (Kimi-K2)
-    ↓
-[Decision Making]
-    ↓
-├─→ SQL Query Tool (Structured Data)
-├─→ Schema Tool (DB Understanding)  
-└─→ Review Search Tool (Unstructured Data)
-    ↓
-FAISS Vector Store ← Customer Reviews
-PostgreSQL ← Chinook Database
-    ↓
-Final Answer
-```
+The server currently includes:
 
-## 🚀 Setup & Installation
+| Area | Implementation |
+| --- | --- |
+| Wire protocol | Length-aware RESP2 reader/writer, pipelining, binary-safe bulk strings, nesting and size limits |
+| Core data | Strings, expiry, conditional `SET`, `MGET`/`MSET`, counters, type checks |
+| Lists | `LPUSH`, `RPUSH`, `LRANGE`, `LLEN`, `LPOP`, `RPOP`, `BLPOP`, `BRPOP` with timeouts |
+| Streams | `XADD`, explicit/partial/automatic IDs, `XRANGE`, `XREAD`, blocking reads, `$`, `-`, `+` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`, optimistic aborts, queued errors |
+| Replication | `INFO`, `PSYNC`, empty RDB transfer, replica handshake, propagation, ACKs, `WAIT` |
+| Persistence | RDB string snapshots with expiry and AOF manifest/incremental replay with `always`, `everysec`, `no` |
+| Pub/Sub | Channels, patterns, subscribe mode, `PING`, publish, message delivery and unsubscribe |
+| Sorted sets | `ZADD`, `ZRANGE`, `ZRANK`, `ZCARD`, `ZSCORE`, `ZREM`, deterministic score/member ordering |
+| Bitmaps | `SETBIT`, `GETBIT`, growth, `BITCOUNT`, `BITOP` with unequal source lengths |
+| Geospatial | `GEOADD`, coordinate validation, `GEOPOS`, `GEODIST`, radius `GEOSEARCH` |
+| Authentication | `ACL WHOAMI`, `ACL GETUSER`, `ACL SETUSER`, nopass/passwords, `AUTH`, enforcement |
 
-### Prerequisites
-- Python 3.8+
-- PostgreSQL (running locally or Docker)
-- Groq API Key
+The deliberately small runtime uses only the Go standard library. A single
+mutex protects the in-memory store, while a per-connection write mutex keeps
+asynchronous Pub/Sub and replication frames from interleaving.
 
-### 1. Clone the repo
+## Run it
+
+Requirements: Go 1.21 or newer. The commands below write data below `./data`.
+
 ```bash
-git clone <your-repo-url>
-cd chinook-rag-system
+go run ./cmd/pulsekv \
+  -port 6379 \
+  -dir ./data \
+  -dbfilename dump.rdb \
+  -appendonly yes \
+  -appendfsync everysec
 ```
 
-### 2. Install dependencies
+Connect with any RESP2 client, including `redis-cli`:
+
+```text
+redis-cli -p 6379 SET greeting "hello from pulsekv"
+redis-cli -p 6379 GET greeting
+redis-cli -p 6379 XADD events '*' kind created
+```
+
+For a disposable container image:
+
 ```bash
-pip install streamlit langchain langchain-community langchain-groq langchain-huggingface
-pip install faiss-cpu sentence-transformers psycopg2-binary python-dotenv
+docker build -t pulsekv-go .
+docker run --rm -p 6379:6379 -v "$PWD/data:/data" pulsekv-go
 ```
 
-### 3. Load Chinook Database
+The container starts without authentication for local learning. Set an ACL
+password before exposing it beyond localhost; see
+[`docs/protocol.md`](docs/protocol.md#authentication).
+
+## Development commands
+
 ```bash
-# Download from: https://github.com/lerocha/chinook-database
-# Then load into PostgreSQL
-psql -U postgres -d chinook -f Chinook_PostgreSQL.sql
+make fmt       # fail if any Go file needs formatting
+make test      # unit and integration tests
+make race      # race detector (requires loopback sockets for server tests)
+make vet       # static checks
+make build     # bin/pulsekv
 ```
 
-**Note:** If you hit encoding issues like I did, force UTF-8:
-```bash
-psql -U postgres --set client_encoding=UTF8 -d chinook -f Chinook_PostgreSQL.sql
+The same checks run in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+The network integration tests intentionally use real loopback TCP connections;
+they catch framing, blocking, Pub/Sub, AOF restart, and replication regressions
+that an in-process command test cannot see.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C["RESP2 clients"] --> L["net.Listener"]
+    L --> S["per-connection serve loop"]
+    S --> R["length-aware RESP reader"]
+    R --> D["command dispatcher"]
+    D --> T["transaction / ACL / PubSub state"]
+    D --> M["Store: strings, lists, streams, zsets, bitmaps, geo"]
+    M --> E["expiry + version + change notifications"]
+    D --> A["AOF append + replication frame"]
+    M --> P["RDB snapshot for SAVE / PSYNC"]
+    A --> F["durable files"]
+    A --> Q["replica connections"]
 ```
 
-**If you get UTF-16LE encoding warnings:**
-Git might detect some files as UTF-16LE and offer to transcode them to UTF-8 on commit. This is fine! UTF-8 is the standard and will work better across different systems. Just let Git do the conversion.
+The request path, lock boundaries, persistence format, and replication
+handshake are explained with larger diagrams in
+[`docs/architecture.md`](docs/architecture.md),
+[`docs/persistence.md`](docs/persistence.md), and
+[`docs/replication.md`](docs/replication.md).
 
-### 4. Prepare Your Review Data
-Create a JSON file with customer reviews (example structure):
-```json
-[
-  {"review": "Great album, fast shipping!", "rating": 5},
-  {"review": "Sound quality could be better", "rating": 3}
-]
-```
+## Correctness decisions
 
-### 5. Build FAISS Index
-Run the embedding script to create your vector store:
-```python
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+* RESP bulk payloads are read with `io.ReadFull` using the declared byte
+  length. A value containing a newline therefore cannot consume the next
+  pipelined command.
+* Mutating commands take one server-level serialization lock before changing
+  the store, appending AOF, or broadcasting replication frames. The store has
+  its own lock so readers and blocking waiters never access maps directly.
+* Overwriting a key clears its old expiry. Expiry also removes non-string data,
+  advances its watch version, and wakes blockers.
+* A blocked list or stream read captures the change channel before checking
+  state and rechecks it before sleeping. That closes the lost-wakeup race
+  between a failed read and a producer.
+* A replica receives `FULLRESYNC`, a generated RDB snapshot, then canonical
+  RESP command frames. `WAIT` asks replicas for `GETACK` and counts only offsets
+  at or beyond the write being waited on.
 
-# Load your review data and create embeddings
-embeddings=HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-vector_store=FAISS.from_documents(documents, embeddings)
-vector_store.save_local("json_faiss_index")
-```
+Each choice is recorded as an ADR with the rejected alternative and the
+failure it prevents. See [`docs/adr`](docs/adr).
 
-### 6. Configure Environment
-Create a `.env` file:
-```
-GROQ_API_KEY=your_groq_api_key_here
-```
+## Failure scenarios used in the design
 
-### 7. Run the App
-```bash
-streamlit run app.py
-```
+The repository documents incidents as testable scenarios rather than hiding
+them in implementation folklore. Examples include a newline in a bulk value,
+a stale TTL after overwrite, a producer racing a blocked `BLPOP`, a malformed
+ECHO request, an interrupted final AOF frame, and a replica disconnect during
+propagation. Reproduction steps and the current response are in
+[`docs/failure-scenarios.md`](docs/failure-scenarios.md).
 
-## 🎬 Demo Video
+## Portfolio split
 
+| Repository | Role | Status |
+| --- | --- | --- |
+| [`MetalCloth/pyswitch`](https://github.com/MetalCloth/pyswitch) | Python payment-switch service with Compose deployment, load smoke, and observability | complete local deployment; cloud deployment needs provider credentials/configuration |
+| [`MetalCloth/pulsekv-go`](https://github.com/MetalCloth/pulsekv-go) | Go Redis-compatible server built from the CodeCrafters checklist | active implementation; archive branch preserves the former `number_41` app |
 
-https://github.com/user-attachments/assets/9deed786-ab30-4513-86ed-6a27fd3dccf5
+The C++ PulseKV repository remains independent and paused. No source is shared
+between the Python and Go repositories.
 
+## Resume-ready framing
 
-
-## 💀 The Journey (aka What Went Wrong)
-
-### Battle 1: PostgreSQL Encoding Hell
-**Problem:** Database wouldn't load due to encoding issues  
-**Solution:** Forced UTF-8 encoding during import. PostgreSQL can be picky about character sets.
-
-### Battle 2: JSON Embedding Nightmare  
-**Problem:** Original plan to embed JSON directly was a massive pain  
-**Solution:** Switched to a simpler text-based format for reviews. Sometimes simple is better.
-
-### Battle 3: Knowledge Base Construction Stuck
-Got completely stuck on Part 2 of the assignment - combining structured and unstructured data into a unified knowledge base. The theoretical approach seemed elegant but was super complex to implement.
-
-**Solution:** Pivoted to a tool-based approach instead. Let the agent decide which source to use rather than trying to merge everything upfront.
-
-### Battle 4: Snowflake API Disaster
-**Problem:** Was trying to use Snowflake's Arctic model, but it kept failing  
-**Solution:** Ditched it. Not worth the headache.
-
-### Battle 5: Gemini API Died at the Worst Moment
-**Problem:** My free Gemini API quota ran out right when I was testing  
-**Solution:** Switched to Groq's Kimi-K2 model. Actually faster and more reliable!
-
-### Battle 6: Recursion Limit Hell
-```
-Error: Recursion limit of 25 reached without hitting a stop condition...
-```
-**Problem:** LangGraph agent was getting stuck in loops  
-**Solution:** Switched from a custom agent to LangGraph's `create_react_agent`. Pre-built tools are your friend.
-
-## 🛠️ Technical Decisions
-
-### Why ReAct Agent?
-The ReAct (Reasoning + Acting) pattern lets the LLM think step-by-step and use tools dynamically. Perfect for this use case where we need to:
-1. Understand the question
-2. Decide which data source to use
-3. Execute the right tool
-4. Synthesize the answer
-
-### Why FAISS?
-- Fast similarity search
-- Works locally (no external dependencies)
-- Easy to save/load
-- Good enough for moderate-scale data
-
-### Why Kimi-K2?
-- Fast inference via Groq
-- Good at following tool-use instructions
-- Free tier is generous
-- Better than dealing with API quotas
-
-### Why Streamlit?
-Originally assignment asked for React, but Streamlit let me:
-- Prototype faster
-- Show agent reasoning in real-time
-- Skip frontend setup complexity
-
-## 📊 Evaluation & Accuracy
-
-### Testing Approach
-1. **Known-answer questions** - Asked questions where I knew the correct answer from the DB
-2. **Cross-source questions** - Questions requiring both SQL and review search
-3. **Edge cases** - Weird phrasing, ambiguous queries, multi-step reasoning
-
-### Success Rate
-- **Simple SQL queries:** ~95% accurate
-- **Review search:** ~85% relevant (depends on review quality)
-- **Complex multi-tool questions:** ~70% (sometimes agent doesn't use all needed tools)
-
-### Common Failure Cases
-1. **Agent doesn't use enough tools** - Sometimes answers from memory instead of searching
-2. **SQL syntax errors** - Occasionally generates invalid joins
-3. **Ambiguous questions** - "Tell me about Jazz" (the genre? The customer named Jazz?)
-4. **Review search too broad** - Generic queries return less relevant results
-
-### Improvements for Production
-- Add query validation before executing SQL
-- Implement retry logic for failed tool calls
-- Cache common queries to reduce LLM calls
-- Add explicit examples in the system prompt
-- Use a more powerful model for complex reasoning
-- Add user feedback loop to improve over time
-
-## 🔧 Configuration
-
-### Database Connection
-Edit `db_url` in `app.py`:
-```python
-db_url="postgresql+psycopg2://username:password@localhost:5432/chinook"
-```
-
-### Model Selection
-Switch models by changing the `llm` initialization:
-```python
-llm=ChatGroq(
-    model="moonshotai/kimi-k2-instruct-0905",  # or try llama-3.3-70b-versatile
-    temperature=0,
-    max_tokens=2048,
-)
-```
-
-## 📁 Project Structure
-```
-chinook-rag-system/
-├── app.py                  # Main Streamlit app
-├── json_faiss_index/       # Vector store (FAISS)
-├── reviews.json            # Customer review data
-├── .env                    # API keys (DON'T COMMIT THIS)
-├── requirements.txt        # Python dependencies
-└── README.md              # You are here
-```
-
-## 🚨 Known Issues
-- FAISS index needs to be rebuilt if you change the embedding model
-- Long SQL results can overflow the UI
-- Agent sometimes makes redundant tool calls
-- No authentication (fine for demo, bad for production)
-
-## 🎓 What I Learned
-1. **Don't overcomplicate things** - My initial "unified knowledge base" approach was too complex
-2. **Tool-based agents are powerful** - Let the LLM decide what to do
-3. **Prototype fast, refine later** - Getting something working beats perfect architecture
-4. **Error handling matters** - Spent half the time debugging edge cases
-5. **API quotas are real** - Always have a backup LLM provider
-
-## 📝 Future Enhancements
-- [ ] Add conversation memory (multi-turn dialogue)
-- [ ] Implement caching for common queries
-- [ ] Better error messages for users
-- [ ] Export results to CSV/PDF
-- [ ] Add authentication and user sessions
-- [ ] Deploy to cloud (Streamlit Cloud or Hugging Face Spaces)
-- [ ] Add more data sources (Excel files, PDFs, etc.)
-
-## 🙏 Acknowledgments
-- Chinook Database by Luis Rocha
-- LangChain & LangGraph teams
-- Sentence Transformers for embeddings
-- Groq for fast inference
-
-## 📜 License
-MIT License - Do whatever you want with this code
-
----
-
-Built with ☕ and determination during a 2-day sprint. If this helps you, star the repo! ⭐
+* Built a binary-safe RESP2 server in Go with concurrent clients, blocking
+  data structures, optimistic transactions, persistence, and primary/replica
+  replication.
+* Added race-detector coverage for storage invariants and real TCP integration
+  tests for pipelining, Pub/Sub, blocking reads, AOF recovery, and `WAIT`.
+* Documented protocol, concurrency, persistence, replication, incident
+  scenarios, and architectural decisions with reproducible commands.
