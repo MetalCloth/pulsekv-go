@@ -288,14 +288,32 @@ func TestServerAOFRecovery(t *testing.T) {
 func TestServerReplicationAndWait(t *testing.T) {
 	_, masterAddr, _ := startTestServer(t, Config{Addr: freeAddress(t)})
 	masterClient := dialTestClient(t, masterAddr)
+	requireSimple(t, masterClient.command(t, "SET", "snapshotted", "before-replica"), "OK")
 	replicaConfig := Config{Addr: freeAddress(t), ReplicaOf: masterAddr}
 	_, replicaAddr, _ := startTestServer(t, replicaConfig)
 	replicaClient := dialTestClient(t, replicaAddr)
 
 	// The replica performs a full sync asynchronously; polling keeps the test
 	// independent of scheduler timing while still exercising the wire handshake.
-	requireSimple(t, masterClient.command(t, "SET", "replicated", "one"), "OK")
 	deadline := time.Now().Add(3 * time.Second)
+	for {
+		value := replicaClient.command(t, "GET", "snapshotted")
+		if got, ok := value.StringValue(); ok && got == "before-replica" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replica did not load the RDB snapshot: %#v", value)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	info := replicaClient.command(t, "INFO", "replication")
+	infoText, _ := info.StringValue()
+	if !strings.Contains(infoText, "role:slave") || !strings.Contains(infoText, "master_replid:") {
+		t.Fatalf("replica INFO is missing replication state: %q", infoText)
+	}
+	requireInteger(t, masterClient.command(t, "WAIT", "1", "2000"), 1)
+	requireSimple(t, masterClient.command(t, "SET", "replicated", "one"), "OK")
+	deadline = time.Now().Add(3 * time.Second)
 	for {
 		value := replicaClient.command(t, "GET", "replicated")
 		if got, ok := value.StringValue(); ok && got == "one" {
