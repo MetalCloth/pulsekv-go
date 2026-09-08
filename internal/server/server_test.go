@@ -255,6 +255,42 @@ func TestServerAOFRecovery(t *testing.T) {
 	requireBulk(t, dialTestClient(t, secondAddr).command(t, "GET", "durable"), "yes")
 }
 
+func TestServerReplicationAndWait(t *testing.T) {
+	_, masterAddr, _ := startTestServer(t, Config{Addr: freeAddress(t)})
+	masterClient := dialTestClient(t, masterAddr)
+	replicaConfig := Config{Addr: freeAddress(t), ReplicaOf: masterAddr}
+	_, replicaAddr, _ := startTestServer(t, replicaConfig)
+	replicaClient := dialTestClient(t, replicaAddr)
+
+	// The replica performs a full sync asynchronously; polling keeps the test
+	// independent of scheduler timing while still exercising the wire handshake.
+	requireSimple(t, masterClient.command(t, "SET", "replicated", "one"), "OK")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		value := replicaClient.command(t, "GET", "replicated")
+		if got, ok := value.StringValue(); ok && got == "one" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replica did not receive SET: %#v", value)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	requireInteger(t, masterClient.command(t, "WAIT", "1", "2000"), 1)
+	requireInteger(t, masterClient.command(t, "RPUSH", "replicated-list", "value"), 1)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		value := replicaClient.command(t, "LRANGE", "replicated-list", "0", "-1")
+		if len(value.Array) == 1 && string(value.Array[0].Bytes) == "value" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replica did not receive RPUSH: %#v", value)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func readValue(t *testing.T, reader *resp.Reader) resp.Value {
 	t.Helper()
 	value, err := reader.Read()
