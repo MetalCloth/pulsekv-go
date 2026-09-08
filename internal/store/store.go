@@ -460,6 +460,10 @@ func parseStreamID(value string, end bool) (StreamID, error) {
 	return StreamID{ms, seq}, nil
 }
 
+func ParseStreamID(value string, end bool) (StreamID, error) {
+	return parseStreamID(value, end)
+}
+
 func nextStreamID(requested string, last StreamID) (StreamID, error) {
 	if requested == "*" {
 		id := StreamID{uint64(time.Now().UnixMilli()), 0}
@@ -770,6 +774,162 @@ func (s *Store) GeoLocation(key, member string) (GeoLocation, bool, error) {
 	}
 	location, ok := s.geos[key][member]
 	return location, ok, nil
+}
+
+func (s *Store) GeoMembers(key string) (map[string]GeoLocation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(key, time.Now())
+	if kind := s.kindLocked(key); kind != TypeNone && kind != TypeZSet {
+		return nil, ErrWrongType
+	}
+	result := make(map[string]GeoLocation, len(s.geos[key]))
+	for member, location := range s.geos[key] {
+		result[member] = location
+	}
+	return result, nil
+}
+
+func (s *Store) SetBit(key string, offset int, bit byte) (int, error) {
+	if offset < 0 {
+		return 0, errors.New("bit offset is not an unsigned integer")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(key, time.Now())
+	if kind := s.kindLocked(key); kind != TypeNone && kind != TypeString {
+		return 0, ErrWrongType
+	}
+	index := offset / 8
+	if index >= len(s.strings[key]) {
+		grown := make([]byte, index+1)
+		copy(grown, s.strings[key])
+		s.strings[key] = grown
+	}
+	mask := byte(1 << (7 - (offset % 8)))
+	old := 0
+	if s.strings[key][index]&mask != 0 {
+		old = 1
+	}
+	if bit == 1 {
+		s.strings[key][index] |= mask
+	} else {
+		s.strings[key][index] &^= mask
+	}
+	s.touchLocked(key)
+	return old, nil
+}
+
+func (s *Store) GetBit(key string, offset int) (int, error) {
+	if offset < 0 {
+		return 0, errors.New("bit offset is not an unsigned integer")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(key, time.Now())
+	if kind := s.kindLocked(key); kind != TypeNone && kind != TypeString {
+		return 0, ErrWrongType
+	}
+	index := offset / 8
+	if index >= len(s.strings[key]) {
+		return 0, nil
+	}
+	if s.strings[key][index]&(1<<(7-offset%8)) != 0 {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func (s *Store) BitCount(key string, start, end *int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(key, time.Now())
+	if kind := s.kindLocked(key); kind != TypeNone && kind != TypeString {
+		return 0, ErrWrongType
+	}
+	data := s.strings[key]
+	if start == nil || end == nil {
+		startValue, endValue := 0, len(data)-1
+		start, end = &startValue, &endValue
+	}
+	lo, hi, ok := normalizeRange(len(data), *start, *end)
+	if !ok {
+		return 0, nil
+	}
+	count := 0
+	for _, value := range data[lo : hi+1] {
+		count += bitsSet(value)
+	}
+	return count, nil
+}
+
+func bitsSet(value byte) int {
+	count := 0
+	for value != 0 {
+		value &= value - 1
+		count++
+	}
+	return count
+}
+
+func (s *Store) BitOp(operation, destination string, sources ...string) (int, error) {
+	operation = strings.ToUpper(operation)
+	if operation != "AND" && operation != "OR" && operation != "XOR" && operation != "NOT" {
+		return 0, errors.New("unsupported BITOP operation")
+	}
+	if operation == "NOT" && len(sources) != 1 || operation != "NOT" && len(sources) == 0 {
+		return 0, errors.New("wrong number of BITOP arguments")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, key := range append(append([]string(nil), sources...), destination) {
+		s.purgeExpiredLocked(key, time.Now())
+		if kind := s.kindLocked(key); kind != TypeNone && kind != TypeString {
+			return 0, ErrWrongType
+		}
+	}
+	length := 0
+	for _, key := range sources {
+		if len(s.strings[key]) > length {
+			length = len(s.strings[key])
+		}
+	}
+	result := make([]byte, length)
+	if operation == "NOT" {
+		for i := range result {
+			if i < len(s.strings[sources[0]]) {
+				result[i] = ^s.strings[sources[0]][i]
+			} else {
+				result[i] = 0xff
+			}
+		}
+	} else {
+		for i := range result {
+			value := byte(0)
+			if operation == "AND" {
+				value = 0xff
+			}
+			for _, key := range sources {
+				var current byte
+				if i < len(s.strings[key]) {
+					current = s.strings[key][i]
+				}
+				switch operation {
+				case "AND":
+					value &= current
+				case "OR":
+					value |= current
+				case "XOR":
+					value ^= current
+				}
+			}
+			result[i] = value
+		}
+	}
+	s.strings[destination] = result
+	delete(s.expires, destination)
+	s.touchLocked(destination)
+	return length, nil
 }
 
 func normalizeRange(length, start, stop int) (int, int, bool) {
