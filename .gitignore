@@ -1,0 +1,16 @@
+# Go build and test output
+/bin/
+/.cache/
+*.test
+*.out
+
+# Runtime data
+/data/
+appendonlydir/
+dump.rdb
+*.rdb
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
