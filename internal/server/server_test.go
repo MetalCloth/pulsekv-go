@@ -186,6 +186,42 @@ func TestServerListsStreamsSortedSetsBitmapsAndGeo(t *testing.T) {
 	if distance := client.command(t, "GEODIST", "cities", "bengaluru", "bengaluru", "km"); distance.Kind != resp.BulkString {
 		t.Fatalf("unexpected geodist: %#v", distance)
 	}
+	search := client.command(t, "GEOSEARCH", "cities", "FROMLONLAT", "77.5946", "12.9716", "BYRADIUS", "1", "km", "WITHDIST", "WITHCOORD", "COUNT", "1")
+	if len(search.Array) != 1 || len(search.Array[0].Array) != 3 {
+		t.Fatalf("unexpected geosearch: %#v", search)
+	}
+}
+
+func TestServerExtendedCommandEdges(t *testing.T) {
+	_, addr, _ := startTestServer(t, Config{Addr: freeAddress(t)})
+	client := dialTestClient(t, addr)
+	requireSimple(t, client.command(t, "MSET", "one", "1", "two", "2"), "OK")
+	mget := client.command(t, "MGET", "one", "missing", "two")
+	if len(mget.Array) != 3 || string(mget.Array[0].Bytes) != "1" || !mget.Array[1].Null || string(mget.Array[2].Bytes) != "2" {
+		t.Fatalf("unexpected MGET: %#v", mget)
+	}
+	requireInteger(t, client.command(t, "INCR", "one"), 2)
+	requireInteger(t, client.command(t, "DECR", "one"), 1)
+	requireSimple(t, client.command(t, "SET", "temporary", "value", "PX", "1000"), "OK")
+	requireInteger(t, client.command(t, "PERSIST", "temporary"), 1)
+	requireInteger(t, client.command(t, "TTL", "temporary"), -1)
+	if kind := client.command(t, "TYPE", "temporary"); kind.Kind != resp.SimpleString || string(kind.Bytes) != "string" {
+		t.Fatalf("unexpected TYPE response: %#v", kind)
+	}
+
+	if timedOut := client.command(t, "BRPOP", "empty", "0.02"); !timedOut.NullArray {
+		t.Fatalf("BRPOP timeout returned %#v", timedOut)
+	}
+	if timedOut := client.command(t, "XREAD", "BLOCK", "20", "STREAMS", "empty-stream", "0-0"); !timedOut.NullArray {
+		t.Fatalf("XREAD timeout returned %#v", timedOut)
+	}
+
+	requireInteger(t, client.command(t, "SETBIT", "bits-a", "0", "1"), 0)
+	requireInteger(t, client.command(t, "SETBIT", "bits-b", "1", "1"), 0)
+	requireInteger(t, client.command(t, "BITOP", "AND", "bits-and", "bits-a", "bits-b"), 1)
+	requireInteger(t, client.command(t, "GETBIT", "bits-and", "0"), 0)
+	requireInteger(t, client.command(t, "BITOP", "OR", "bits-or", "bits-a", "bits-b"), 1)
+	requireInteger(t, client.command(t, "GETBIT", "bits-or", "0"), 1)
 }
 
 func TestServerTransactionsWatchBlockingAndPubSub(t *testing.T) {
